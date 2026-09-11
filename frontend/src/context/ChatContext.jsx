@@ -16,20 +16,22 @@ export function ChatProvider({ children }) {
   const [resourcesModalOpen, setResourcesModalOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
+  const [hasInitialized, setHasInitialized] = useState(false);
+
   // Fetch user conversations whenever authentication state changes
-  const fetchConversations = useCallback(async () => {
+  const fetchConversations = useCallback(async (shouldSelectFirst = false) => {
     if (!isAuthenticated) {
       setConversations([]);
       setCurrentConversation(null);
       setCurrentConversationId(null);
+      setHasInitialized(false);
       return;
     }
     setLoadingConversations(true);
     try {
       const list = await api.getConversations();
       setConversations(list);
-      if (list.length > 0 && !currentConversationId) {
-        // Select the most recently updated conversation
+      if (shouldSelectFirst && list.length > 0) {
         selectConversation(list[0].id);
       }
     } catch (err) {
@@ -37,11 +39,16 @@ export function ChatProvider({ children }) {
     } finally {
       setLoadingConversations(false);
     }
-  }, [isAuthenticated, currentConversationId]);
+  }, [isAuthenticated]);
 
   useEffect(() => {
-    fetchConversations();
-  }, [isAuthenticated]);
+    if (isAuthenticated && !hasInitialized) {
+      fetchConversations(true);
+      setHasInitialized(true);
+    } else if (!isAuthenticated) {
+      fetchConversations(false);
+    }
+  }, [isAuthenticated, hasInitialized, fetchConversations]);
 
   // Load active conversation details
   const selectConversation = async (convId) => {

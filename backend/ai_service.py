@@ -10,7 +10,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
 # System Prompt embodying SDG 1 Financial Inclusion, Financial Literacy, Safety & Disclaimer
 NIVAARAN_SYSTEM_INSTRUCTION = """
@@ -72,8 +72,7 @@ def build_fallback_response(user_message: str, conversation_history: List[Dict[s
         )
 
     # 2. Budgeting & Saving (e.g. 20000 per month)
-    if any(w in query for w in ["budget", "save", "saving", "earn", "salary", "20000", "10000", "50000", "income", "manage money"]):
-        # Extract salary if mentioned
+    if any(w in query for w in ["budget", "save", "saving", "earn", "salary", "20000", "10000", "50000", "15000", "income", "manage money"]):
         amount_match = re.search(r'₹?\s*(\d{1,2}(?:,\d{2,3})*(?:\.\d+)?|\d+)\s*(?:k|thousand|rupees|per month|/mo|pm)?', query)
         salary_text = "₹20,000"
         if amount_match and int(amount_match.group(1).replace(",", "")) > 1000:
@@ -150,19 +149,27 @@ async def generate_chat_response(
     model_name: Optional[str] = None
 ) -> str:
     """
-    Generate an AI response using Google Gemini API or intelligent financial inclusion fallback.
+    Generate an AI response using Google Gemini API with multi-model fallback and local reasoning backup.
     `messages` format: list of {"role": "user" | "assistant", "content": "..."}
     """
-    api_key = _clean_api_key(GEMINI_API_KEY)
-    target_model = model_name or GEMINI_MODEL or "gemini-2.5-flash"
-
-    # Get the latest user query
+    api_key = _clean_api_key(os.getenv("GEMINI_API_KEY", GEMINI_API_KEY))
+    preferred_model = model_name or os.getenv("GEMINI_MODEL", "gemini-flash-latest")
     user_query = messages[-1]["content"] if messages else ""
 
-    # If no valid API key configured, use our rich local educational engine
     if not api_key:
         logger.info("No Gemini API key provided. Using built-in financial inclusion knowledge engine.")
         return build_fallback_response(user_query, messages[:-1])
+
+    candidate_models = [
+        preferred_model,
+        "gemini-flash-latest",
+        "gemini-3.5-flash",
+        "gemini-flash-lite-latest",
+        "gemini-pro-latest"
+    ]
+    # Remove duplicate order while preserving first preference
+    seen = set()
+    candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
 
     # 1. Attempt using google.genai SDK
     try:
@@ -188,58 +195,62 @@ async def generate_chat_response(
             max_output_tokens=2048,
         )
 
-        response = client.models.generate_content(
-            model=target_model,
-            contents=contents,
-            config=config
-        )
-
-        if response and response.text:
-            return response.text.strip()
+        for candidate in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=candidate,
+                    contents=contents,
+                    config=config
+                )
+                if response and response.text:
+                    return response.text.strip()
+            except Exception as model_err:
+                logger.warning(f"Model {candidate} failed: {model_err}. Trying next candidate...")
 
     except Exception as e:
-        logger.warning(f"google.genai SDK attempt failed: {e}. Attempting REST API fallback.")
+        logger.warning(f"google.genai SDK execution error: {e}. Attempting REST API fallback.")
 
     # 2. Fallback to direct Gemini REST API call via httpx
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
-        
-        # Build contents payload
-        gemini_contents = []
-        for msg in messages:
-            role = "user" if msg["role"] == "user" else "model"
-            gemini_contents.append({
-                "role": role,
-                "parts": [{"text": msg["content"]}]
-            })
+    for candidate in candidate_models:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate}:generateContent?key={api_key}"
+            
+            gemini_contents = []
+            for msg in messages:
+                role = "user" if msg["role"] == "user" else "model"
+                gemini_contents.append({
+                    "role": role,
+                    "parts": [{"text": msg["content"]}]
+                })
 
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": NIVAARAN_SYSTEM_INSTRUCTION}]
-            },
-            "contents": gemini_contents,
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 2048
+            payload = {
+                "system_instruction": {
+                    "parts": [{"text": NIVAARAN_SYSTEM_INSTRUCTION}]
+                },
+                "contents": gemini_contents,
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 2048
+                }
             }
-        }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts and "text" in parts[0]:
-                        return parts[0]["text"].strip()
-            else:
-                logger.warning(f"Gemini REST returned {resp.status_code}: {resp.text}")
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                resp = await http_client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts and "text" in parts[0]:
+                            return parts[0]["text"].strip()
+                else:
+                    logger.warning(f"Gemini REST returned {resp.status_code} for {candidate}")
 
-    except Exception as e:
-        logger.error(f"Gemini REST API error: {e}")
+        except Exception as e:
+            logger.error(f"Gemini REST API error for {candidate}: {e}")
 
-    # If external API fails, return built-in financial knowledge response
+    # If all external API calls fail or timeout, use built-in financial knowledge response
+    logger.info("Falling back to local financial education reasoning engine.")
     return build_fallback_response(user_query, messages[:-1])
 
 
@@ -248,7 +259,6 @@ async def generate_conversation_title(first_message: str) -> str:
     if not first_message:
         return "New Financial Conversation"
 
-    # Truncate clean title heuristic
     cleaned = re.sub(r'[^\w\s₹$€%]', '', first_message).strip()
     words = cleaned.split()
 
@@ -257,7 +267,6 @@ async def generate_conversation_title(first_message: str) -> str:
     else:
         title = " ".join(words[:5])
 
-    # Capitalize title
     title = title.capitalize()
     if len(title) > 45:
         title = title[:42] + "..."
