@@ -6,6 +6,10 @@ token.json
 # Temporary / Intermediate files
 .tmp/
 
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
 # Python cache & virtual environments
 __pycache__/
 *.py[cod]
